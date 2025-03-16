@@ -1,0 +1,324 @@
+        .z80
+
+        aseg
+        org 0100h
+        .phase 01900h
+
+PIOA        EQU 30h
+PIOB        EQU 31h
+CTRL        EQU 10h
+SHIFT       EQU 02h
+GRAPH       EQU 01h
+CONT_REP_COUNT EQU  50h
+NEW_REP_COUNT EQU 0ffh
+
+CSRSET    EQU  0a54h
+CSROFF    EQU  0a80h
+JAP       EQU  0D1bh
+CPSLCK    EQU  0D1Ah
+
+entry:
+    push bc
+    push hl
+    push de
+    push ix
+    push iy
+entry_loop:
+    ld a, (KEYSTATE)
+    ld b, a
+    and 01h
+    ld (CPSLCK), a
+    ld a, b
+    and 02h
+    ld (JAP), a
+    call CSRSET
+    call SCANKEY
+    ld a, l
+    call KEYDECODE
+    jr c, entry_loop
+    or a
+    jr z, entry_loop
+entry_end:
+    ld b, a
+    call CSROFF
+    ld a, b
+    pop iy
+    pop ix
+    pop de
+    pop hl
+    pop bc
+    ret
+
+    ; --------------
+    ; Input:
+    ;   None
+    ; Output:
+    ;  l: Num new key
+    ;
+SCANKEY:
+    ld ix, SCANSIG
+    ld iy, SCANDATA
+    ld l, 0
+    ld c, 0     ; scan code
+
+SCANKEYLOOP:
+    ; Read scan
+    ld a, (ix)
+    or a
+    ret z
+
+    inc ix
+    out (PIOA), a
+    in a, (PIOB)
+    cpl
+    ;
+    ld e, (iy)
+    ld (iy), a
+    inc iy
+    ld d, a
+    ; new key .. e
+    xor e
+    ld e, a
+    ;  no new key .. 
+    jr z, NEXTSCAN_SKIP
+    ;
+    ld a, c
+    or a
+    jr nz, SCANKEY2
+    ld a, e
+    and (CTRL or SHIFT or GRAPH)
+    jr z, SCANKEY2
+NEXTSCAN_SKIP:
+    ld a, c
+    add a, 8
+    ld c, a
+    jr SCANKEYLOOP
+
+SCANKEY2:
+    ; rel bits
+    ld a, d
+    cpl
+    and e
+    jr z, SCANKEY3
+
+    ; released
+    ld a, l
+    or a
+    jr nz, SCANKEY3
+    ld l, 0
+    ld a, 0ffh
+    ld (ACTIVEKEY), a
+    jr NEXTSCAN_SKIP
+
+SCANKEY3:
+    ; new active keys
+    ld a, d
+    and e
+    ld b, 8
+
+    ; Get Scan code of the new key
+SCANKEY4:
+    srl a
+    jr nc, SCANKEY5
+    ld e, a
+    ld a, c
+    ld (ACTIVEKEY), a
+    ld a, e
+    inc l
+
+SCANKEY5:
+    inc c
+    djnz SCANKEY4
+
+NEXTSCAN:
+    jr SCANKEYLOOP
+
+
+    ;---------------
+    ; Input:
+    ;  A ... num new keys
+    ; Output:
+    ;  A .. Key ascii code
+    ;---------------
+KEYDECODE:
+    or a
+    jr nz, KEYDEC_NEWKEY
+    ;; Same key
+    ld a, (ACTIVEKEY)
+    cp 0ffh
+    jr nz, KEYDEC_REP
+    ; no key
+    xor a
+    scf
+    ret
+
+KEYDEC_REP:
+    ld hl, REPEAT
+    dec (hl)
+    jr z, KEYDEC_REP2
+    ld b, 0a0h
+KEYDEC_WAIT:
+    djnz KEYDEC_WAIT
+    xor a
+    ret
+
+KEYDEC_REP2:
+    ld (hl), CONT_REP_COUNT
+    jr CONV_SCANCODE
+
+KEYDEC_NEWKEY:
+    ld a, (SCANDATA)
+    ; CAPS
+    bit 2, a
+    jr z, NEWKEY2
+    ld a, (KEYSTATE)
+    xor 1
+NEWKEY_REV:
+    ld (KEYSTATE), a
+    ld a, 0ffh
+    ld (ACTIVEKEY), a
+    ; carry should be 0
+    xor a
+    ret
+
+NEWKEY2:
+    ; Kana
+    bit 5, a
+    jr z, NEWKEY3
+    ld a, (KEYSTATE)
+    xor 2
+    jr NEWKEY_REV
+
+NEWKEY3:
+    ld a, NEW_REP_COUNT
+    ld (REPEAT), a
+
+CONV_SCANCODE:
+    ;; TODO: click
+    ld a, (SCANDATA)
+    ld c, a
+    ld a, (KEYSTATE)
+    ld b, a
+
+    ld a, (ACTIVEKEY)
+    ld hl, DEFAULT_MAP
+    cp 30h
+    jr c, CONV2
+    ; Check Kana mode
+    bit 1, b
+    jr z, CONV1
+    ld hl, SHIFT_KANA
+    jr CONV2
+CONV1:
+    ; Check SHIFT
+    bit 1, c
+    jr z, CONV2
+    ld hl, SHIFT_ALPHA
+
+CONV2:
+    ld d, 0
+    ld e, a
+    add hl, de
+    ld a, (hl)
+
+    ; Check Kana
+    bit 1, b
+    jr nz, CONV3
+    ; Not Kana ..
+    ; Check caps
+    bit 0, b
+    jr z, CONV_CONTROL
+    ;; CAPS 
+    cp 41h
+    jr c, CONV_CONTROL
+    cp 7bh
+    jr nc, CONV_CONTROL
+    cp 61h
+    jr nc, CONV_CASE
+    cp 5bh
+    jr nc, CONV_CONTROL
+CONV_CASE:
+    xor 20h
+    jr CONV_CONTROL
+CONV3:
+    ; Kana mode ..
+    ; Check SHIFT
+    bit 1, c
+    jr nz, CONV_CONTROL
+    ; Kana + non-SHIFT
+    cp 0a1h
+    jr c, CONV_CONTROL
+    cp 0b0h
+    jr nc, CONV_CONTROL
+    ld hl, NORM_KANA
+    sub 0a1h
+    ld d, 0
+    ld e, a
+    add hl, de
+    ld a, (hl)
+
+CONV_CONTROL:
+    ; Check CONTROL
+    bit 4, c
+    jr z, KEYCODE_END
+    ld hl, DEFAULT_MAP
+    add hl, de
+    ld a, (hl)
+    and 1fh
+
+KEYCODE_END:
+    ;; TODO: Click
+    and a
+    ;; carry should be 0
+    ret
+
+SCANDATA:   DS 12
+ACTIVEKEY:  DB  0ffh
+KEYSTATE:   DB  01h
+REPEAT:      DB  00h
+
+SCANSIG:   
+    DB  11h, 12h, 14h, 18h
+    DB  21h, 22h, 24h, 28h
+    DB  41h, 42h, 44h, 48h
+    DB 00h
+
+DEFAULT_MAP:
+    db 00h, 00h, 00h, 00h, 00h, 00h, 00h, 00h
+    db 30h, 31h, 32h, 33h, 34h, 35h, 36h, 37h
+    db 38h, 39h, 2Dh, 1Fh, 1Eh, 0Bh, 2Eh, 0Dh
+;    db 1Ch, 1Bh, 08h, 09h, 00h, 00h, 00h, 00h
+    db 1Ch, 1Bh, 1dh, 09h, 00h, 00h, 00h, 00h
+;    db 00h, 00h, 00h, 03h, 12h, 1Dh, 00h, 20h
+    db 00h, 00h, 00h, 1bh, 12h, 1Dh, 00h, 20h
+    db 00h, 10h, 20h, 30h, 40h, 50h, 60h, 70h
+
+SHIFT_ALPHA:
+    db 31h, 30h, 34h, 72h, 79h, 5Fh, 5Eh, 5Ch
+    db 32h, 33h, 38h, 74h, 75h, 37h, 40h, 5Bh
+    db 2Dh, 35h, 36h, 66h, 68h, 39h, 3Ah, 5Dh
+    db 71h, 77h, 65h, 67h, 6Ah, 69h, 6Fh, 70h
+    db 61h, 73h, 64h, 76h, 6Eh, 6Bh, 6Ch, 3Bh
+    db 7Ah, 78h, 63h, 62h, 6Dh, 2Ch, 2Eh, 2Fh
+
+SHIFT_KANA:
+    db 21h, 30h, 24h, 52h, 59h, 5Fh, 5Eh, 5Ch
+    db 22h, 23h, 28h, 54h, 55h, 27h, 40h, 7Bh
+    db 3Dh, 25h, 26h, 46h, 48h, 29h, 2Ah, 7Dh
+    db 51h, 57h, 45h, 47h, 4Ah, 49h, 4Fh, 50h
+    db 41h, 53h, 44h, 56h, 4Eh, 4Bh, 4Ch, 2Bh
+    db 5Ah, 58h, 43h, 42h, 4Dh, 3Ch, 3Eh, 3Fh
+
+    db 0C7h, 0A6h, 0A9h, 0BDh, 0DDh, 0DBh, 0CDh, 0B0h
+    db 0CCh, 0A7h, 0ADh, 0B6h, 0C5h, 0ACh, 0DEh, 0A2h
+    db 0CEh, 0AAh, 0ABh, 0CAh, 0B8h, 0AEh, 0B9h, 0A3h
+    db 0C0h, 0C3h, 0A8h, 0B7h, 0CFh, 0C6h, 0D7h, 0BEh
+    db 0C1h, 0C4h, 0BCh, 0CBh, 0D0h, 0C9h, 0D8h, 0DAh
+    db 0AFh, 0BBh, 0BFh, 0BAh, 0D3h, 0A4h, 0A1h, 0A5h
+
+NORM_KANA:
+    db 0D9h, 0DFh, 0D1h, 0C8h, 0D2h, 0DCh, 0B1h, 0B2h
+    db 0B3h, 0B4h, 0B5h, 0D4h, 0D5h, 0D6h, 0C2h
+
+    .dephase
+    end
